@@ -1,9 +1,8 @@
-name: EMA Premium Screener Bot
+name: EMA Premium Screener V2
 
 on:
   schedule:
-    # UTC saatleri, örnek: günde 5 kez (09, 13, 17, 21, 01 Türkiye civarı)
-    - cron: "5 6,10,14,18,22 * * *"
+    - cron: "0 11 * * *"   # Her gün 11:00 UTC (Türkiye ~14:00)
   workflow_dispatch:
 
 jobs:
@@ -11,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Kodu çek
+      - name: Repo’yu çek
         uses: actions/checkout@v4
 
       - name: Python kur
