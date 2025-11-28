@@ -27,7 +27,7 @@ def jget(path, params=None, retries=3, timeout=10):
 
 
 # --------- OKX Fonksiyonları ---------
-def get_usdt_spot_instruments(limit=150):
+def get_usdt_spot_instruments(limit=120):
     data = jget("/api/v5/public/instruments", {"instType": "SPOT"})
     insts = [d["instId"] for d in data["data"] if d["instId"].endswith("-USDT")]
     return insts[:limit]
@@ -100,7 +100,6 @@ def obv_features(df):
         else:
             obv.append(obv[-1])
     s = pd.Series(obv)
-    # son 10 bara göre trend
     if len(s) < 15:
         return False
     return s.iloc[-1] > s.iloc[-10]
@@ -132,7 +131,6 @@ def ema_cross_freshness(df):
         # çoktandır bull alignment var
         return None, True
 
-    # kaç gün önce?
     fresh_days = len(df) - 1 - last_idx
     return fresh_days, True
 
@@ -141,17 +139,16 @@ def ema_cross_freshness(df):
 def buy_volume_ratio_1h(inst_id, limit=60):
     """
     Sadece BUY tarafının hacim oranı (1H).
-    Yaklaşık hesap: toplam hacim * (buy_notional / (buy+sell)).
+    Basit tahmin: son 300 trade içinden buy/sell oranını alıp,
+    1H mum hacmine uygula.
     """
     candles = get_candles(inst_id, bar="1H", limit=limit)
     df = pd.DataFrame(candles)
 
-    # son 300 trade ile buy/sell oranı tahmini
     trades = get_trades(inst_id, limit=300)
     if not trades or df.empty:
         return 0.0
 
-    # kabaca son X trade = son X saat gibi farz ediyoruz
     buy_notional = sum(t["px"] * t["sz"] for t in trades if t["side"] == "buy")
     sell_notional = sum(t["px"] * t["sz"] for t in trades if t["side"] == "sell")
     total_notional = buy_notional + sell_notional
@@ -159,7 +156,6 @@ def buy_volume_ratio_1h(inst_id, limit=60):
         return 0.0
 
     buy_ratio = buy_notional / total_notional
-
     df["buy_vol_est"] = df["vol"] * buy_ratio
 
     if len(df) < 25:
@@ -205,12 +201,21 @@ def trend_4h(inst_id):
     h4 = get_candles(inst_id, bar="4H", limit=40)
     df = pd.DataFrame(h4)
     if len(df) < 15:
-        return 0.0
+        return 0.0, False, False
     last = df["close"].iloc[-1]
     base = df["close"].iloc[-10]
     if base <= 0:
-        return 0.0
-    return (last - base) / base * 100.0
+        return 0.0, False, False
+    change = (last - base) / base * 100.0
+
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    ema_bull = df["ema20"].iloc[-1] > df["ema50"].iloc[-1]
+
+    macd_line, signal, hist = macd_features(df["close"])
+    macd_bull = macd_line.iloc[-1] > signal.iloc[-1] and macd_line.iloc[-1] > 0
+
+    return change, ema_bull, macd_bull
 
 
 # --------- Piyasa Yönü (BTC & ETH) ---------
@@ -230,7 +235,6 @@ def market_direction():
             df["ema50"] = ema(df["close"], 50)
             trend_up = df["ema20"].iloc[-1] > df["ema50"].iloc[-1]
 
-            # 4H fiyat değişimi
             if len(df) >= 15:
                 t_change = (df["close"].iloc[-1] - df["close"].iloc[-10]) / df["close"].iloc[-10] * 100
             else:
@@ -251,12 +255,19 @@ def market_direction():
         avg_delta = sum(net_deltas)
         avg_whale = sum(whale_balance)
 
-        up_count = sum(1 for t_up, ch, macd_bull in trends if t_up or ch > 0 or macd_bull)
-        down_count = len(trends) - up_count
+        # BTC'ye biraz daha ağırlık
+        up_count = 0
+        down_count = 0
+        for idx, (t_up, ch, macd_bull) in enumerate(trends):
+            weight = 0.65 if idx == 0 else 0.35
+            if (t_up and ch > 0 and macd_bull):
+                up_count += weight
+            elif (not t_up and ch < 0 and not macd_bull):
+                down_count += weight
 
-        if up_count >= 2 and avg_delta > 0 and avg_whale > 0:
+        if up_count >= 0.7 and avg_delta > 0 and avg_whale > 0:
             return "🟢", "Boğa (alıcılar güçlü)"
-        if down_count >= 2 and avg_delta < 0:
+        if down_count >= 0.7 and avg_delta < 0:
             return "🔴", "Ayı (satıcı baskın)"
         return "🟡", "Yatay / belirsiz"
     except Exception:
@@ -274,45 +285,45 @@ def score_coin(features):
     elif fresh_days is None:
         ema_pts = 10
     elif fresh_days <= 1:
-        ema_pts = 20
+        ema_pts = 22
     elif fresh_days <= 3:
         ema_pts = 18
     elif fresh_days <= 5:
-        ema_pts = 12
+        ema_pts = 10
     else:
-        ema_pts = 7
+        ema_pts = 5
     score += ema_pts
 
-    # BUY hacim vRatio
+    # BUY hacim vRatio (daha sıkı)
     v = features["vratio_buy"]
-    if v > 5:
+    if v > 4:
         score += 20
-    elif v > 3:
+    elif v > 2.5:
         score += 15
-    elif v > 1.5:
+    elif v > 1.8:
         score += 10
-    elif v > 1.0:
-        score += 5
 
-    # Whale gücü
+    # Whale gücü (daha kritik)
     w = features["whale"]
     b = features["big_whale"]
     xxl = features["xxl_whale"]
     net = features["net_buy_delta"]
 
-    score += min(10, w * 3)  # 0-10
+    score += min(8, w * 2)
     if b > 0:
-        score += 5
+        score += 8
     if xxl > 0:
-        score += 10
+        score += 12
     if net > 0:
+        score += 5
+    if net > 300000:
         score += 5
 
     # 4H trend
     t = features["trend4h"]
-    if t > 5:
+    if t > 6:
         score += 15
-    elif t > 2:
+    elif t > 3:
         score += 10
     elif t > 1:
         score += 5
@@ -320,11 +331,9 @@ def score_coin(features):
     # RSI
     r = features["rsi"]
     if r is not None:
-        if r > 60:
+        if 45 <= r <= 65:
             score += 10
-        elif r >= 50:
-            score += 8
-        elif r >= 40:
+        elif 40 <= r < 45 or 65 < r <= 70:
             score += 5
 
     # MACD & OBV
@@ -332,6 +341,13 @@ def score_coin(features):
         score += 5
     if features["obv_bull"]:
         score += 5
+
+    # Günlük likidite bonusu (yüksek hacim iyidir)
+    dv = features["daily_quote_vol"]
+    if dv > 20_000_000:
+        score += 5
+    elif dv > 5_000_000:
+        score += 3
 
     return max(0, min(100, int(score)))
 
@@ -357,9 +373,21 @@ def analyze_coin(inst_id, market_emoji, market_text):
     dfd = pd.DataFrame(daily)
     dfd = compute_ema_block(dfd)
 
+    # Günlük yaklaşık likidite (son mum)
+    last_close = float(dfd["close"].iloc[-1])
+    last_vol = float(dfd["vol"].iloc[-1])
+    daily_quote_vol = last_close * last_vol  # ~ USDT hacmi
+
+    # düşük likiditeli çöpleri ele
+    if daily_quote_vol < 1_000_000:
+        return None
+
     fresh_days, ema_bull = ema_cross_freshness(dfd)
     if not ema_bull:
-        # EMA yukarı hizalanmamışsa hiç sinyal yok (SELL yok zaten)
+        return None
+
+    # EMA cross çok eski ise sıkı modda istemiyoruz
+    if fresh_days is not None and fresh_days > 3:
         return None
 
     dfd["rsi"] = rsi(dfd["close"])
@@ -368,13 +396,28 @@ def analyze_coin(inst_id, market_emoji, market_text):
     obv_bull = obv_features(dfd[["close", "vol"]])
 
     rsi_last = float(dfd["rsi"].iloc[-1]) if pd.notna(dfd["rsi"].iloc[-1]) else None
-    last_price = float(dfd["close"].iloc[-1])
+
+    # RSI aralık filtresi (aşırı şişmiş / ölü istemiyoruz)
+    if rsi_last is not None and (rsi_last < 40 or rsi_last > 70):
+        return None
 
     vratio = buy_volume_ratio_1h(inst_id, limit=60)
-    t4 = trend_4h(inst_id)
+    # 1H buy hacim artışı yeterli değilse eliyoruz
+    if vratio <= 1.8:
+        return None
+
+    t4_change, t4_ema_bull, t4_macd_bull = trend_4h(inst_id)
+    # 4H trend pozitif değilse eliyoruz
+    if t4_change <= 0 or not t4_ema_bull:
+        return None
 
     trades = get_trades(inst_id, limit=200)
     ws = whale_stats(trades)
+
+    # En az 1 whale + net buy delta pozitif olsun
+    total_whales = ws["whale"] + ws["big"] + ws["xxl"]
+    if total_whales == 0 or ws["net_buy_delta"] <= 0:
+        return None
 
     features = {
         "ema_fresh_days": fresh_days,
@@ -384,39 +427,48 @@ def analyze_coin(inst_id, market_emoji, market_text):
         "big_whale": ws["big"],
         "xxl_whale": ws["xxl"],
         "net_buy_delta": ws["net_buy_delta"],
-        "trend4h": t4,
+        "trend4h": t4_change,
         "rsi": rsi_last,
-        "macd_bull": macd_bull,
+        "macd_bull": macd_bull or t4_macd_bull,
         "obv_bull": obv_bull,
+        "daily_quote_vol": daily_quote_vol,
     }
 
     score = score_coin(features)
 
-    # Uyarı metni (engel yok, sadece info)
+    # çok zayıf skorları hiç göstermiyoruz
+    if score < 60:
+        return None
+
+    # Ayı piyasasında ekstra sert filtre: 60–70 arası skoru bazen silebiliriz
+    if market_emoji == "🔴" and score < 75:
+        return None
+
     notes = []
     if rsi_last is not None and rsi_last < 45:
-        notes.append("RSI zayıf ⚠️")
-    if t4 < 0:
-        notes.append("4H trend aşağı ⚠️")
-    if vratio <= 1.0:
-        notes.append("BUY hacim zayıf ⚠️")
-    if ws["net_buy_delta"] <= 0:
-        notes.append("Net alım zayıf ⚠️")
+        notes.append("RSI sınırda (zayıf momentum riski) ⚠️")
+    if 65 < rsi_last <= 70:
+        notes.append("RSI yüksek (kısa vadede düzeltme gelebilir) ⚠️")
+    if t4_change < 3:
+        notes.append("4H trend pozitif ama çok güçlü değil ⚠️")
+    if ws["net_buy_delta"] < 100000:
+        notes.append("Net BUY delta görece düşük ⚠️")
     if market_emoji == "🔴":
-        notes.append("Piyasa AYI modunda ⚠️")
+        notes.append("Genel piyasa AYI, ekstra risk ⚠️")
 
     return {
         "inst": inst_id,
-        "price": last_price,
+        "price": last_close,
         "score": score,
         "ema_fresh_days": fresh_days,
         "vratio_buy": round(vratio, 2),
-        "trend4h": round(t4, 2),
+        "trend4h": round(t4_change, 2),
         "rsi": round(rsi_last, 2) if rsi_last is not None else None,
         "whale": ws["whale"],
         "big_whale": ws["big"],
         "xxl_whale": ws["xxl"],
         "net_buy_delta": int(ws["net_buy_delta"]),
+        "daily_quote_vol": int(daily_quote_vol),
         "notes": "; ".join(notes) if notes else "",
     }
 
@@ -439,23 +491,27 @@ def run():
             print(f"[!] {inst} hata: {e}")
         time.sleep(0.2)  # API'yı yormamak için
 
+    lines = [
+        f"⚡ EMA Premium Screener V2 (Sadece ALIM, Ultra Sıkı Filtre)",
+        f"⏱ {ts()}",
+        "",
+        f"📌 Piyasa Yönü: {market_emoji} {market_text}",
+        "",
+    ]
+
     if not results:
-        msg = f"⚡ EMA Premium Screener\n⏱ {ts()}\n\n📌 Piyasa Yönü: {market_emoji} {market_text}\n\nBugün kriterlere uyan alım sinyali bulunamadı."
+        lines.append("Bugün ultra sıkı filtrelere uyan *hiçbir* coin bulunamadı.")
+        lines.append("→ Bu normal: bot kaliteyi sayıya tercih ediyor.")
+        msg = "\n".join(lines)
         send_telegram(msg)
         return
 
     # skorla sırala, en yüksekten
     results.sort(key=lambda x: x["score"], reverse=True)
-    top = results[:10]
+    top = results[:5]  # en fazla 5 tane gösterelim
 
-    lines = [
-        f"⚡ EMA Premium Screener (Sadece ALIM Sinyali)",
-        f"⏱ {ts()}",
-        "",
-        f"📌 Piyasa Yönü: {market_emoji} {market_text}",
-        "",
-        f"Top {len(top)} coin (0-100 Güven Puanı):",
-    ]
+    lines.append(f"Top {len(top)} coin (0-100 Güven Puanı):")
+    lines.append("")
 
     for i, r in enumerate(top, start=1):
         fresh_txt = "bilinmiyor"
@@ -471,7 +527,7 @@ def run():
         )
         line3 = (
             f"   Whale: {r['whale']} / Big: {r['big_whale']} / XXL: {r['xxl_whale']} | "
-            f"Net BUY: {r['net_buy_delta']} USDT"
+            f"Net BUY: {r['net_buy_delta']} USDT | Günlük likidite: ~{r['daily_quote_vol']} USDT"
         )
         lines.append(line1)
         lines.append(line2)
